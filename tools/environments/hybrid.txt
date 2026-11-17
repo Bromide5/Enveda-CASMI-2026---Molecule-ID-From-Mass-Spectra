@@ -1,0 +1,2 @@
+-r transformer.txt
+rdkit>=2024.3,<2027

@@ -1,6 +1,20 @@
+# Python cache and local tooling
 tmp/
 **/__pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+
+# Local data and generated experiment results
 data/raw/*
 !data/raw/.gitkeep
 data/processed/*
@@ -9,9 +23,21 @@ data/external/*
 !data/external/.gitkeep
 outputs/*
 !outputs/.gitkeep
+
+# Model checkpoints and large training artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+
+# Kaggle build packages and downloaded outputs
 submission/build/*
 !submission/build/.gitkeep
+submission/kaggle/output/
+outputs/kaggle_*/
+
+# Kaggle credentials and local secrets
 .kaggle/
 access_token
 kaggle.json
-.env

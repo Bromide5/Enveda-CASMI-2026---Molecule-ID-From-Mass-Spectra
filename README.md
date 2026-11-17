@@ -117,6 +117,156 @@ python -m evaluation.compare_runs --a outputs/B0 --b outputs/A2
 </details>
 
 <details>
+<summary><strong>可选：为 Transformer 准备训练数据（第一步）</strong></summary>
+
+数据管道位于 `evaluation/build_training_split.py` 和 `algorithms/transformer/dataset.py`，实现数据划分和批次采样。本步骤复用 `casmi-course` 环境，不需要安装 PyTorch；后续的编码器检查和训练需要 PyTorch。
+
+先完成前面的 5000 张谱抽样，再按 `inchikey14` 将结构划为模型训练、验证、最终检查三组。每个结构至少需要两张不同的谱；完全重复谱会去重，完全相同输入却有冲突结构标签的谱会剔除。少于两张谱的结构暂不参加此项实验。默认约 80%/10%/10% 按**结构数**划分，各验证组至少保留两个结构。
+
+```text
+python -m evaluation.build_training_split --reference data/processed/reference_sample.parquet --out data/processed/transformer_split --seed 0
+python -m algorithms.transformer.dataset --train data/processed/transformer_split/train.parquet --structures-per-batch 8 --spectra-per-structure 2 --batches 3 --out outputs/T0/data_check.json
+```
+
+输出结构如下；划分目录和检查报告已存在时会拒绝覆盖，复现实验请使用新的路径。
+
+```text
+data/processed/transformer_split/
+├── train.parquet                  # 只用这一份更新模型参数
+├── validation/
+│   ├── reference.parquet          # 验证参考谱库
+│   ├── queries.parquet            # 不含结构标签的验证查询
+│   └── labels.csv                 # 验证答案
+├── holdout/                       # 同样的三个文件，固定方案后才评价
+├── manifest.csv                   # 每张谱的输入行号、结构、摘要和归属
+└── split.json                     # 清洗统计、划分参数和规模
+```
+
+验证与 holdout 的结构不参与模型参数训练，但各自的参考库保留查询结构的其他谱。这测量的是“模型未训练过的结构，在有对应参考谱时能否找回”，不等于从库外生成新结构。结构覆盖按 `inchikey14` 计算；质量窗口、加合物过滤后仍可能没有正确候选。此划分没有做骨架隔离或互变异构体统一。
+
+默认每个验证结构抽一张查询谱。如果要测试多谱融合，可在划分命令中设置 `--queries-per-structure 2`；这会要求每个结构至少有三张谱，以便留出参考谱。训练每结构抽样数量 K 若大于 2，也应同步设置划分脚本的 `--spectra-per-structure K`。
+
+批次检查命令每批抽取 8 个不同结构，每个结构抽 2 张不同谱，预期输入维度为 `[16, 1500]`、标签维度为 `[16]`。标签只用来确定正负样本，不能作为编码器的输入。检查报告验证非有限数值、向量范数和批次结构计数。随机采样允许跨批重复，不承诺每轮遍历所有谱。
+
+安装 PyTorch 后，数据集和采样器可直接接入其 `DataLoader`：
+
+```python
+from torch.utils.data import DataLoader
+from algorithms.transformer.dataset import SpectrumDataset, PKBatchSampler
+
+dataset = SpectrumDataset("data/processed/transformer_split/train.parquet")
+sampler = PKBatchSampler(dataset.labels, structures_per_batch=8, spectra_per_structure=2)
+loader = DataLoader(dataset, batch_sampler=sampler, num_workers=0)
+
+sampler.set_epoch(0)  # 每个 epoch 调用一次，传入当前轮次
+batch = next(iter(loader))
+spectra, labels = batch["spectrum"], batch["label"]
+```
+
+训练时应把每个同结构样本都视为正样本，不要把同一结构的其他谱当作负样本。分箱、强度变换和质量范围必须在训练与推理时保持一致。
+
+此版本会把抽样后的峰数组加载到内存；建议先用小样本检查流程，再扩大抽样。不要直接把约 3 GB 的原始训练文件传给该划分脚本或数据集。小样本中可组成正样本的结构通常远少于谱数，检查 `split.json` 后再决定是否扩大样本。
+
+验证数据隔离和采样逻辑的测试命令：
+
+```text
+python -m unittest discover -s tests -p test_training_data.py -v
+```
+
+</details>
+
+<details>
+<summary><strong>可选：检查 Transformer Encoder（第二步）</strong></summary>
+
+`algorithms/transformer/model.py` 实现共享权重的谱编码器，参数由 `configs/transformer.json` 配置。查询谱和参考谱调用同一个 `SpectrumEncoder` 实例。结构标签只用于后续损失计算。
+
+```text
+分箱强度 [B,1500]
+→ Linear(1,128) + 质量分箱中心的正余弦编码 [B,1500,128]
+→ 2 层双向 Transformer Encoder（4 个头，前馈维度 512）
+→ 非空分箱均值池化 [B,128]
+→ Linear(128,128) + L2 归一化 [B,128]
+```
+
+零强度分箱不能作为注意力的 key/value，也不参与池化；位置编码保留峰的质量位置。没有因果遮罩、Decoder 或自回归生成。各编码层独立初始化，使用 PyTorch 的 [TransformerEncoderLayer](https://docs.pytorch.org/docs/stable/generated/torch.nn.TransformerEncoderLayer.html)。这里仍然计算完整的稠密序列，屏蔽空分箱并不会消除长序列的计算开销。
+
+先在项目根目录安装依赖（以下为 CPU 版本；GPU 版本按 [PyTorch 官方安装页](https://pytorch.org/get-started/locally/) 选择）：
+
+```text
+conda activate casmi-course
+python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -r tools/environments/transformer.txt
+python -m algorithms.transformer.check_model --train data/processed/transformer_split/train.parquet --backward --out outputs/T0/model_check.json
+python -m unittest discover -s tests -p "test_*.py" -v
+```
+
+检查脚本用 DataLoader 取出一批 16 张真实训练谱，默认每次处理 2 张，拼回 `[16,128]` 输出，以降低 CPU 内存占用。`--backward` 对一个小批次使用随机目标检查梯度，**不更新参数，不代表完成训练，也不能用该损失判断检索性能**。报告已存在时需选择新的输出路径。
+
+正式训练见下一节。实验性的检索与生成混合入口见 [混合模型流程](algorithms/transformer/HYBRID.md)，现有 baseline 和 Kaggle 提交入口尚未接入这个模型。
+
+</details>
+
+<details>
+<summary><strong>可选：训练 Transformer Encoder（第三步）</strong></summary>
+
+`algorithms/transformer/losses.py` 实现监督式多正样本对比损失：每张谱作为 anchor，同结构的其他谱都是正样本，不同结构为负样本。分母包含批次内除自身以外的所有谱，对每个正样本的负对数概率求平均。默认温度为 0.1。
+
+`algorithms/transformer/train.py` 使用 AdamW，按 `zero_grad → forward → loss → backward → 梯度裁剪 → optimizer.step` 更新共享编码器。默认学习率为 1e-4，权重衰减为 0.01，梯度裁剪阈值为 1。标签不输入网络。
+
+先进行 4 次真实权重更新的流程检查（已有输出目录时请换新名称）：
+
+```text
+python -m algorithms.transformer.train --train data/processed/transformer_split/train.parquet --epochs 2 --batches-per-epoch 2 --structures-per-batch 2 --spectra-per-structure 2 --out outputs/T1_smoke
+```
+
+此命令每批使用 2 个结构、每结构 2 张谱，共 4 张。训练需要完整批次共同计算对比损失，不使用检查脚本的独立小批次诊断方式。1500 个 token 的稠密注意力仍较耗内存，先用小批次跑通再扩大 P。小批次的负样本较少。
+
+输出文件：
+
+- `config.json`：模型、预处理和训练参数、数据规模。
+- `history.json`：各轮训练平均损失、裁剪前梯度范数与累计更新次数。
+- `last.pt`：最后完成轮次的模型权重、优化器状态及配置，每轮保存一次。
+- `summary.json`：总更新次数、相对初始化的参数变化量。
+
+读取训练权重进行推理：
+
+```python
+import torch
+from algorithms.transformer.model import SpectrumEncoder, SpectrumEncoderConfig
+
+checkpoint = torch.load("outputs/T1_smoke/last.pt", map_location="cpu", weights_only=True)
+model = SpectrumEncoder(SpectrumEncoderConfig(**checkpoint["model_config"]))
+model.load_state_dict(checkpoint["model_state_dict"])
+model.eval()
+# spectra 必须使用检查点中的 bin_width、max_mz、power 进行预处理。
+with torch.no_grad():
+    vectors = model(spectra)
+```
+
+省略 `--batches-per-epoch` 时，采样器按可用结构数估算每轮批次数；允许跨批重复，不保证遍历全部谱。训练入口当前从头训练，尚未提供断点续训参数。
+
+训练只读取指定的训练文件，不使用验证集或 holdout。当前保存的是最后一轮，而非验证选出的最佳模型。四次更新只验证流程；训练损失下降也不能代替检索准确率评估。后续可使用 [混合模型流程](algorithms/transformer/HYBRID.md) 训练 Decoder、构造库内/库外验证、校准检索门控并运行混合预测。
+
+### 在 Kaggle GPU 上训练 Encoder
+
+`submission/kaggle/train_encoder.py` 是本地训练实现，`submission/prepare_encoder_training.py` 会生成一个自包含的单文件 Kaggle 训练脚本，把 Encoder、数据管道和配置嵌入其中。这样 Kaggle 的 script Kernel 不需要导入旁边的 `algorithms/` 目录。脚本默认从竞赛挂载的 `/kaggle/input/**/train.parquet` 读取数据，输出检查点到 `/kaggle/working/encoder_run`。
+
+```text
+python -m submission.prepare_encoder_training --out submission/build/K0_encoder --username YOUR_USERNAME
+kaggle kernels push -p submission/build/K0_encoder/notebook
+```
+
+Kaggle 页面或 metadata 中应启用 GPU；竞赛数据通过 `competition_sources` 挂载，Internet 保持关闭。首次先用较小步数确认显存和路径：
+
+```text
+python train_encoder.py --epochs 1 --batches-per-epoch 20 --structures-per-batch 4 --spectra-per-structure 2 --amp --out /kaggle/working/encoder_smoke
+```
+
+正式运行可增加 `--batches-per-epoch` 和 `--epochs`。`--amp` 只在 CUDA 上启用混合精度；每轮保存 `last.pt`、`history.json` 和 `summary.json`。训练完成后从 Kaggle 输出下载 `last.pt`，在本地验证集上评估和校准门控，再训练 Decoder。当前脚本把整张 parquet 读入内存，直接处理数 GB 全量文件前应先确认 Kaggle 内存；`num_workers` 默认 2，Windows 本地验证使用 `--num-workers 0`。
+
+</details>
+
+<details>
 <summary><strong>第三步：使用 B2 全量谱库提交到 Kaggle</strong></summary>
 
 B0 用 5000 张谱练习流程，B2 将参考库扩大为全部训练谱。B2 保持分箱宽度 1、强度平方根变换、20 ppm 筛选和最高分合并，分批读取数据。全量参考库始终保留，程序只对符合当前查询筛选条件的谱计算相似度。
